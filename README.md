@@ -13,3 +13,10 @@ https://wokwi.com/projects/420908950128021505
 anyway...documentation will go on my site: https://zeyus.com/
 
 I'm going to use the following components:
+
+- ESP32 WROOM
+- SSD1315 128x64 OLED I2C display
+- MPU6050 6-axis accelerometer/gyro
+- 500mAh LiPo battery (402035) - hopefully enough, I can always upgrade it, but I want to try and make it as small as possible
+- AMS1117 3.3V voltage regulator
+- TBD: Design and 3D print a case
