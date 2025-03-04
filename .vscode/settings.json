@@ -1,0 +1,8 @@
+{
+    "files.associations": {
+        "*.rmd": "rmd",
+        "*.Rmd": "rmd",
+        "ostream": "cpp",
+        "print": "cpp"
+    }
+}
