@@ -29,7 +29,51 @@
 #define GRID_SIZE 16
 #define CELL_SIZE (SIM_WIDTH/GRID_SIZE)
 
-DisplaySSD1306_128x64_I2C display(-1); 
+/**
+ * Class implements SSD1306 128x64 lcd display in 1 bit mode over I2C
+ * overrides default implementation to expose private m_i2c
+ */
+ class DisplaySSD1306_128x64_I2Cx: public DisplaySSD1306_128x64<InterfaceSSD1306<PlatformI2c>>
+ {
+ public:
+     /**
+      * @brief Inits 128x64 lcd display over i2c (based on SSD1306 controller): 1-bit mode.
+      *
+      * Inits 128x64 lcd display over i2c (based on SSD1306 controller): 1-bit mode
+      * @param rstPin pin controlling LCD reset (-1 if not used)
+      * @param config platform i2c configuration. Please refer to SPlatformI2cConfig.
+      */
+     explicit DisplaySSD1306_128x64_I2Cx(int8_t rstPin, const SPlatformI2cConfig &config = {-1, 0x3C, -1, -1, 0})
+         : DisplaySSD1306_128x64(m_i2c, rstPin)
+         , m_i2c(*this, -1,
+                 SPlatformI2cConfig{config.busId, static_cast<uint8_t>(config.addr ?: 0x3C), config.scl, config.sda,
+                                    config.frequency ?: 400000})
+     {
+     }
+ 
+     /**
+      * Initializes SSD1306 lcd in 1-bit mode
+      */
+     void begin() override;
+ 
+     /**
+      * Closes connection to display
+      */
+     void end() override;
+     InterfaceSSD1306<PlatformI2c> m_i2c;
+ };
+ void DisplaySSD1306_128x64_I2Cx::begin()
+ {
+     m_i2c.begin();
+     DisplaySSD1306_128x64::begin();
+ }
+ 
+ void DisplaySSD1306_128x64_I2Cx::end()
+ {
+     DisplaySSD1306_128x64::end();
+     m_i2c.end();
+ }
+DisplaySSD1306_128x64_I2Cx display(-1); 
 MPU6050 mpu;
 
 // I2C device found at address 0x3C  ! // OLED
@@ -92,6 +136,9 @@ void initSerial() {
 void initI2C() {
   Wire.begin();
   Wire.setClock(400000);
+  display.m_i2c.displayOn();
+  display.m_i2c.setContrast(0);
+  
 }
 
 
@@ -131,24 +178,22 @@ void mpuMotionDetectMode() {
   // set up MPU
   // docs recommend waiting for at least 50ms after reset
   mpu.reset();
-  delay(100);
+  lcd_delay(100);
   mpu.resetSensors();
-  delay(100);
+  lcd_delay(100);
   mpu.setAccelerometerPowerOnDelay(2); //max 3
   mpu.setTempSensorEnabled(false);
   // disable fifo when sleeping
   mpu.setFIFOEnabled(false);
   // low pass filter, 42Hz
   mpu.setDLPFMode(MPU6050_DLPF_BW_42);
-  delay(10);
+  lcd_delay(10);
   // high pass filter, from current value (should not be done while in motion)
   mpu.setDHPFMode(MPU6050_DHPF_HOLD);
 
   // mpu.setIntEnabled(0);
   // set interrupt to be high when motion detected
-  mpu.setInterruptMode(MPU6050_INTMODE_ACTIVEHIGH);
-  // apparently this is more accurate
-  // See https://github.com/ElectronicCats/mpu6050/blob/master/src/MPU6050.cpp
+  mpu.setInterruptMode(MPU6050_INTMODE_ACTIVELOW);
   mpu.setClockSource(MPU6050_CLOCK_INTERNAL);
   // lowest accel sens
   mpu.setFullScaleAccelRange(MPU6050_ACCEL_FS_2);
@@ -165,12 +210,12 @@ void mpuMotionDetectMode() {
   // mpu.setZAccelOffset(7687);
   // level of movement required to trigger interrupt
   // recommended default is 20
-  mpu.setMotionDetectionThreshold(20);
+  mpu.setMotionDetectionThreshold(1);
   // number of milliseconds that the sensor must be at the threshold
-  mpu.setMotionDetectionDuration(2);
+  mpu.setMotionDetectionDuration(1);
 
   // enable only motion detection interrupt
-  mpu.setIntEnabled(1 << MPU6050_INTERRUPT_MOT_BIT);
+  mpu.setIntEnabled((1 << MPU6050_INTERRUPT_MOT_BIT) | (1 << MPU6050_INTERRUPT_FF_BIT));
   mpuSetInterruptMode();
   // ensure the accellerometers are on
   // mpu.setStandbyXAccelEnabled(false);
@@ -421,6 +466,7 @@ void sleepTimer() {
 #ifdef DEBUG
     Serial.println(F("Going to sleep"));
 #endif
+    display.m_i2c.displayOff();
     // detach interrupt
     detachInterrupt(digitalPinToInterrupt(EXT0_PIN));
     // sleep
@@ -428,7 +474,8 @@ void sleepTimer() {
     // clear any pending interrupts
     mpu.getIntStatus();
     // enable wakeup from ext0
-    esp_sleep_enable_ext0_wakeup(GPIO_NUM_34, 1);
+    esp_sleep_enable_ext0_wakeup(GPIO_NUM_34, 0);
+    lcd_delay(100);
     esp_deep_sleep_start();
   }
 }
