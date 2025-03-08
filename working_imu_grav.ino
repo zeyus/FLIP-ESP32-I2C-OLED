@@ -5,8 +5,16 @@
 // #include "MPU6050_6Axis_MotionApps20.h"
 #include "MPU6050_6Axis_MotionApps612.h"
 
-DisplaySSD1306_128x64_I2C display(-1); 
-MPU6050 mpu;
+// comment out to disable debug output / serial / led
+#define DEBUG
+// LED for debugging interrupts
+#define LED 17
+
+// sleep params
+#define SLEEP_AFTER_MS 10000
+
+// External interrupt source
+#define EXT0_PIN 34
 
 // Simulation constants
 #define SIM_WIDTH 128
@@ -18,8 +26,11 @@ MPU6050 mpu;
 #define PRESSURE_RADIUS 3.5f
 #define PRESSURE_FORCE 0.9f
 #define MAX_VEL 2.0f
-#define IMU_ADDRESS 0x68
-#define LED 2
+#define GRID_SIZE 16
+#define CELL_SIZE (SIM_WIDTH/GRID_SIZE)
+
+DisplaySSD1306_128x64_I2C display(-1); 
+MPU6050 mpu;
 
 // I2C device found at address 0x3C  ! // OLED
 // I2C device found at address 0x68  ! // IMU
@@ -42,11 +53,10 @@ Particle particles[NUM_PARTICLES];
 uint8_t canvasData[SIM_WIDTH*(SIM_HEIGHT/8)]; // because of 1bit display, not RGB
 NanoCanvas1 canvas(SIM_WIDTH, SIM_HEIGHT, canvasData);
 
+/*---Sleep/wake vars---*/
+uint32_t lastZMot = 0;
+bool zMotInterrupt = false;
 
-#define GRID_SIZE 16
-#define CELL_SIZE (SIM_WIDTH/GRID_SIZE)
-
-int const INTERRUPT_PIN = 18;
 /*---MPU6050 Control/Status Variables---*/
 bool DMPReady = false;  // Set true if DMP init was successful
 uint8_t MPUIntStatus;   // Holds actual interrupt status byte from MPU
@@ -57,17 +67,156 @@ uint8_t FIFOBuffer[64]; // FIFO storage buffer
 Quaternion q;           // [w, x, y, z]         Quaternion container
 VectorInt16 aa;         // [x, y, z]            Accel sensor measurements
 VectorInt16 gy;         // [x, y, z]            Gyro sensor measurements
-VectorInt16 aaReal;     // [x, y, z]            Gravity-free accel sensor measurements
-VectorInt16 aaWorld;    // [x, y, z]            World-frame accel sensor measurements
 VectorFloat gravity;    // [x, y, z]            Gravity vector
 uint16_t fifoCount;
-float euler[3];         // [psi, theta, phi]    Euler angle container
-float ypr[3];           // [yaw, pitch, roll]   Yaw/Pitch/Roll container and gravity vector
 
 /*------Interrupt detection routine------*/
 volatile bool MPUInterrupt = true;     // Indicates whether MPU6050 interrupt pin has gone high
 void DMPDataReady() {
   MPUInterrupt = true;
+}
+
+// Setup serial communication
+// only for debugging
+void initSerial() {
+  Serial.begin(115200);
+  while (!Serial) {
+    ;
+  }
+}
+
+// Setup I2C communication for IMU
+// would be nice to remove this library
+// requirement and somehow 
+// reuse the implementation from the OLED
+void initI2C() {
+  Wire.begin();
+  Wire.setClock(400000);
+}
+
+
+void initMpu() {
+  zMotInterrupt = false;
+  lastZMot = 0;
+  // avoid unnecessary resets by checking
+  // a non-default value
+  if (mpu.getAccelerometerPowerOnDelay() == 2) {
+    return;
+  }
+  mpu.initialize();
+  mpu.CalibrateAccel(6);  // Calibration Time: generate offsets and calibrate our MPU6050
+  mpu.CalibrateGyro(6);
+  // time taken for accel to settle after power on
+  // i think 4 is the starting and this adds additional wait time
+  mpu.setAccelerometerPowerOnDelay(2); //max 3
+  mpu.setTempSensorEnabled(false);
+}
+
+void mpuSetInterruptMode(){
+  // set the interrupt to latch until data is read
+  // this is nice so on mpu.getIntStatus() it will clear the interrupt
+  mpu.setInterruptLatch(MPU6050_INTLATCH_WAITCLEAR);
+  mpu.setInterruptLatchClear(MPU6050_INTCLEAR_STATUSREAD);
+
+  // i honeslly don't know what the other versions of this is
+  // it's either push-pull or open-drain
+  mpu.setInterruptDrive(MPU6050_INTDRV_PUSHPULL);
+}
+
+/** mpu setup for motion detection
+ * this will be used to wake the ESP32
+ * from deep sleep (so when ESP is sleeping, accel is in low-ish power mode)
+ */
+void mpuMotionDetectMode() {
+  // set up MPU
+  // docs recommend waiting for at least 50ms after reset
+  mpu.reset();
+  delay(100);
+  mpu.resetSensors();
+  delay(100);
+  mpu.setAccelerometerPowerOnDelay(2); //max 3
+  mpu.setTempSensorEnabled(false);
+  // disable fifo when sleeping
+  mpu.setFIFOEnabled(false);
+  // low pass filter, 42Hz
+  mpu.setDLPFMode(MPU6050_DLPF_BW_42);
+  delay(10);
+  // high pass filter, from current value (should not be done while in motion)
+  mpu.setDHPFMode(MPU6050_DHPF_HOLD);
+
+  // mpu.setIntEnabled(0);
+  // set interrupt to be high when motion detected
+  mpu.setInterruptMode(MPU6050_INTMODE_ACTIVEHIGH);
+  // apparently this is more accurate
+  // See https://github.com/ElectronicCats/mpu6050/blob/master/src/MPU6050.cpp
+  mpu.setClockSource(MPU6050_CLOCK_INTERNAL);
+  // lowest accel sens
+  mpu.setFullScaleAccelRange(MPU6050_ACCEL_FS_2);
+  // lowest gyro sens
+  mpu.setFullScaleGyroRange(MPU6050_GYRO_FS_250);
+  mpu.setDHPFMode(MPU6050_DHPF_RESET); // reset high-pass filter in prep for hold mode
+
+  // // adjust values from calib script example, if needed
+  // mpu.setXGyroOffset(-69);
+  // mpu.setYGyroOffset(-48);
+  // mpu.setZGyroOffset(-19);
+  // mpu.setXAccelOffset(-5158);
+  // mpu.setYAccelOffset(-4576);
+  // mpu.setZAccelOffset(7687);
+  // level of movement required to trigger interrupt
+  // recommended default is 20
+  mpu.setMotionDetectionThreshold(20);
+  // number of milliseconds that the sensor must be at the threshold
+  mpu.setMotionDetectionDuration(2);
+
+  // enable only motion detection interrupt
+  mpu.setIntEnabled(1 << MPU6050_INTERRUPT_MOT_BIT);
+  mpuSetInterruptMode();
+  // ensure the accellerometers are on
+  // mpu.setStandbyXAccelEnabled(false);
+  // mpu.setStandbyYAccelEnabled(false);
+  // mpu.setStandbyZAccelEnabled(false);
+
+  // we can sleep the gyro
+  mpu.setStandbyXGyroEnabled(true);
+  mpu.setStandbyYGyroEnabled(true);
+  mpu.setStandbyZGyroEnabled(true);
+  
+}
+
+/** mpu setup for active monitoring
+ * this will be used to monitor the IMU
+ * while the ESP32 is awake to run the sim
+ */
+void mpuActiveMonitorMode() {
+  // ensure the gyro is on
+  mpu.setStandbyXGyroEnabled(false);
+  mpu.setStandbyYGyroEnabled(false);
+  mpu.setStandbyZGyroEnabled(false);
+  devStatus = mpu.dmpInitialize();
+  // disable motion detection interrupt
+  // and enable data ready interrupt
+  // mpu.setIntEnabled(1 << MPU6050_INTERRUPT_DMP_INT_BIT);
+  // mpuSetInterruptMode();
+  if (devStatus == 0) {
+    mpu.CalibrateAccel(6);  // Calibration Time: generate offsets and calibrate our MPU6050
+    mpu.CalibrateGyro(6);
+    mpu.setDMPEnabled(true);
+    packetSize = mpu.dmpGetFIFOPacketSize(); // Get expected DMP packet size for later comparison
+    mpu.setIntEnabled((1 << MPU6050_INTERRUPT_ZMOT_BIT) | (1 << MPU6050_INTERRUPT_DMP_INT_BIT));
+    mpu.setZeroMotionDetectionDuration(2);
+    mpu.setZeroMotionDetectionThreshold(20);
+    DMPReady = true;
+  }
+#ifdef DEBUG
+  else {
+    Serial.print(F("DMP Initialization failed (code ")); //Print the error code
+    Serial.print(devStatus);
+    Serial.println(F(")"));
+    // 1 = initial memory load failed
+    // 2 = DMP configuration updates failed
+  }
+#endif
 }
 
 
@@ -79,7 +228,9 @@ struct GridCell {
 
 GridCell grid[GRID_SIZE][GRID_SIZE];
 
-bool blinkState;
+#ifdef DEBUG
+bool blinkState = true;
+#endif
 
 void buildSpatialGrid() {
   memset(grid, 0, sizeof(grid));
@@ -104,84 +255,24 @@ void buildSpatialGrid() {
 
 
 void setup() {
-  // String str; // Hhack
-  Serial.begin(38400);
-  while (!Serial) {
-    ;
-  }
-  Serial.println("Initializing MPU...");
-  /*--Start I2C interface--*/
-  #if I2CDEV_IMPLEMENTATION == I2CDEV_ARDUINO_WIRE
-    Wire.begin(); 
-  #elif I2CDEV_IMPLEMENTATION == I2CDEV_BUILTIN_FASTWIRE
-    Fastwire::setup(400, true);
-  #endif
-  mpu.initialize();
-  
-  Serial.println("Testing MPU6050 connection...");
-  // if(mpu.testConnection() ==  false){
-  //   Serial.println("MPU6050 connection failed");
-  //   while(true);
-  // }
-  // else{
-  devStatus = mpu.dmpInitialize();
-  Serial.println("MPU6050 connection successful");
-  mpu.setAccelerometerPowerOnDelay(3);
-  mpu.setSleepEnabled(false);
-  mpu.setStandbyXAccelEnabled(false);
-  mpu.setStandbyYAccelEnabled(false);
-  mpu.setStandbyZAccelEnabled(false);
-  mpu.setDHPFMode(0);
-  mpu.setInterruptLatch(false);
-  mpu.setIntEnabled(true);
-  mpu.setInterruptMode(true);
-  mpu.setIntMotionEnabled(true);
-  
-  mpu.setMotionDetectionDuration(1);
-  mpu.setMotionDetectionThreshold(20);
-  // mpu.setIntDMPEnabled(true);
+  DMPReady = false;
+#ifdef DEBUG
+  initSerial();
+#endif
+  initI2C();
+  initMpu();
+  mpuActiveMonitorMode();
+  pinMode(EXT0_PIN, INPUT);
 
-
-  mpu.setXGyroOffset(-69);
-  mpu.setYGyroOffset(-48);
-  mpu.setZGyroOffset(-19);
-  mpu.setXAccelOffset(-5158);
-  mpu.setYAccelOffset(-4576);
-  mpu.setZAccelOffset(7687);
-
-  mpu.CalibrateAccel(6);  // Calibration Time: generate offsets and calibrate our MPU6050
-  mpu.CalibrateGyro(6);
-  Serial.println("These are the Active offsets: ");
-  mpu.PrintActiveOffsets();
-  Serial.println(F("Enabling DMP..."));   //Turning ON DMP
-  mpu.setDMPEnabled(true);
-  
-  // mpu.setWakeCycleEnabled(true);
-
-  delay(5);
-
-  mpu.setDHPFMode(7);
-  // mpu.setWakeFrequency(5);
-  // mpu.setWakeCycleEnabled(true);
-  // mpu.setStandbyXAccelEnabled(true);
-  // mpu.setStandbyYAccelEnabled(true);
-  // mpu.setStandbyZAccelEnabled(true);
-  // mpu.setIntDMPEnabled(true);
-  // mpu.setSleepEnabled(true);
- 
-
-  /*Enable Arduino interrupt detection*/
+#ifdef DEBUG
+  pinMode(LED, OUTPUT);
+  digitalWrite(LED, blinkState);
   Serial.print(F("Enabling interrupt detection (Arduino external interrupt "));
-  Serial.print(digitalPinToInterrupt(INTERRUPT_PIN));
+  Serial.print(digitalPinToInterrupt(EXT0_PIN));
   Serial.println(F(")..."));
-  attachInterrupt(digitalPinToInterrupt(INTERRUPT_PIN), DMPDataReady, RISING);
+#endif
+  attachInterrupt(digitalPinToInterrupt(EXT0_PIN), DMPDataReady, RISING);
   MPUIntStatus = mpu.getIntStatus();
-  Serial.println(MPUIntStatus);
-  Serial.println(devStatus);
-  /* Set the DMP Ready flag so the main loop() function knows it is okay to use it */
-  Serial.println(F("DMP ready! Waiting for first interrupt..."));
-  DMPReady = true;
-  packetSize = mpu.dmpGetFIFOPacketSize(); //Get expected DMP packet size for later comparison
   // }
   // setup display
   display.begin();
@@ -198,9 +289,6 @@ void setup() {
     particles[i].y = cy + isin(angle) * radius;
     particles[i].vx = random(-50,50)/25.0;  // -2 to +2
     particles[i].vy = random(-25,50)/25.0;   // -1 to +2
-    //Serial.print("\nParticle ");
-    //Serial.print(i);
-    //Serial.print(" done");
   }
 }
 
@@ -292,33 +380,65 @@ void reportIMU() {
   if (!DMPReady) return; // Stop the program if DMP programming fails.
   if (!MPUInterrupt) return;
   MPUIntStatus = mpu.getIntStatus();
+#ifdef DEBUG
+  Serial.println(MPUIntStatus);
+#endif
   /* Read a packet from FIFO */
   fifoCount = mpu.getFIFOCount();
 	// check for overflow (this should never happen unless our code is too inefficient)
 	if ((MPUIntStatus & 0x10) || fifoCount == 1024) {
 		// reset so we can continue cleanly
 		mpu.resetFIFO();
-		Serial.println(F("FIFO overflow!, giro descompensat!!"));
-		Serial.print("&");
-		// otherwise, check for DMP data ready interrupt (this should happen frequently)
-	}
+#ifdef DEBUG
+		Serial.println(F("FIFO overflow, reseting FIFO"));
+#endif
+	} else if (MPUIntStatus & (1 << MPU6050_INTERRUPT_ZMOT_BIT)) {
+    // zero motion interrupt
+    // this is used if the device is placed somewhere or stops moving 
+    // then we initialize the countdown to sleep
+    lastZMot = millis();
+    zMotInterrupt = true;
+  }
+
+  // otherwise, check for DMP data ready interrupt (this should happen frequently)
 	else if (MPUIntStatus & 0x02) {
     if (mpu.dmpGetCurrentFIFOPacket(FIFOBuffer)) { // Get the Latest packet 
         mpu.dmpGetQuaternion(&q, FIFOBuffer);
-        mpu.dmpGetGravity(&gravity, &q);
+        mpu.dmpGetGravity(&gravity, &q); // this is all we care about right now
     }
   }
+#ifdef DEBUG
+// change LED state
+  blinkState = !blinkState;
+  digitalWrite(LED, blinkState);
+#endif
+  // reset interrupt flag
   MPUInterrupt = false;
 }
 
+void sleepTimer() {
+  if (zMotInterrupt && millis() - lastZMot > SLEEP_AFTER_MS) {
+#ifdef DEBUG
+    Serial.println(F("Going to sleep"));
+#endif
+    // detach interrupt
+    detachInterrupt(digitalPinToInterrupt(EXT0_PIN));
+    // sleep
+    mpuMotionDetectMode();
+    // clear any pending interrupts
+    mpu.getIntStatus();
+    // enable wakeup from ext0
+    esp_sleep_enable_ext0_wakeup(GPIO_NUM_34, 1);
+    esp_deep_sleep_start();
+  }
+}
 
 void loop() {
   static uint32_t last_frame = 0;
-  //lcd_delay(5000);
   drawParticles();
   reportIMU();
-  //delay(1000);
   if(millis() - last_frame >= 33) {
+    sleepTimer();
     last_frame = millis();
     applyPhysics();
   } else {
