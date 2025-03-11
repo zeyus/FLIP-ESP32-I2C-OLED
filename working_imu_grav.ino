@@ -565,3 +565,7 @@ void loop() {
     lcd_delay(millis() - last_frame);
   }
 }
+// TODO
+// 1. add proper collision / overlap constraints (so no line of balls)
+// 2. adjust phsyics further, make it more natural
+// 3. adjust particle direction from impulse / accel interaction (gravity is correct, impulse is flipped)
