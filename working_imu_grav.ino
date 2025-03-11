@@ -181,7 +181,7 @@ void mpuMotionDetectMode() {
   lcd_delay(100);
   mpu.resetSensors();
   lcd_delay(100);
-  mpu.setAccelerometerPowerOnDelay(2); //max 3
+  
   mpu.setTempSensorEnabled(false);
   // disable fifo when sleeping
   mpu.setFIFOEnabled(false);
@@ -216,6 +216,7 @@ void mpuMotionDetectMode() {
 
   // enable only motion detection interrupt
   mpu.setIntEnabled((1 << MPU6050_INTERRUPT_MOT_BIT) | (1 << MPU6050_INTERRUPT_FF_BIT));
+  mpu.setAccelerometerPowerOnDelay(2); //max 3
   mpuSetInterruptMode();
   // ensure the accellerometers are on
   // mpu.setStandbyXAccelEnabled(false);
@@ -226,6 +227,10 @@ void mpuMotionDetectMode() {
   mpu.setStandbyXGyroEnabled(true);
   mpu.setStandbyYGyroEnabled(true);
   mpu.setStandbyZGyroEnabled(true);
+
+  mpu.setWakeFrequency(50);
+  mpu.setWakeCycleEnabled(true);
+  mpu.setSleepEnabled(true);
   
 }
 
@@ -475,7 +480,7 @@ void sleepTimer() {
     mpu.getIntStatus();
     // enable wakeup from ext0
     esp_sleep_enable_ext0_wakeup(GPIO_NUM_34, 0);
-    lcd_delay(100);
+    lcd_delay(150);
     esp_deep_sleep_start();
   }
 }
