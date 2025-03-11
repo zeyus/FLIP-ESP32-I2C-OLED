@@ -112,6 +112,13 @@ Quaternion q;           // [w, x, y, z]         Quaternion container
 VectorInt16 aa;         // [x, y, z]            Accel sensor measurements
 VectorInt16 gy;         // [x, y, z]            Gyro sensor measurements
 VectorFloat gravity;    // [x, y, z]            Gravity vector
+VectorInt16 rawAccel; // scaled
+VectorInt16 lastAccel = {0, 0, 0};
+VectorInt16 accelDelta = {0, 0, 0};
+float accelMagnitude = 0;
+float lastAccelMagnitude = 0;
+float maxAccelImpulse = 0;
+
 uint16_t fifoCount;
 
 /*------Interrupt detection routine------*/
@@ -167,7 +174,8 @@ void mpuSetInterruptMode(){
 
   // i honeslly don't know what the other versions of this is
   // it's either push-pull or open-drain
-  mpu.setInterruptDrive(MPU6050_INTDRV_PUSHPULL);
+  // mpu.setInterruptDrive(MPU6050_INTDRV_PUSHPULL);
+  mpu.setInterruptMode(MPU6050_INTMODE_ACTIVELOW);
 }
 
 /** mpu setup for motion detection
@@ -175,63 +183,35 @@ void mpuSetInterruptMode(){
  * from deep sleep (so when ESP is sleeping, accel is in low-ish power mode)
  */
 void mpuMotionDetectMode() {
-  // set up MPU
-  // docs recommend waiting for at least 50ms after reset
+  // Clear any existing settings
   mpu.reset();
-  lcd_delay(100);
-  mpu.resetSensors();
-  lcd_delay(100);
+  delay(100);
+  mpu.initialize();
   
-  mpu.setTempSensorEnabled(false);
-  // disable fifo when sleeping
-  mpu.setFIFOEnabled(false);
-  // low pass filter, 42Hz
-  mpu.setDLPFMode(MPU6050_DLPF_BW_42);
-  lcd_delay(10);
-  // high pass filter, from current value (should not be done while in motion)
-  mpu.setDHPFMode(MPU6050_DHPF_HOLD);
-
-  // mpu.setIntEnabled(0);
-  // set interrupt to be high when motion detected
-  mpu.setInterruptMode(MPU6050_INTMODE_ACTIVELOW);
-  mpu.setClockSource(MPU6050_CLOCK_INTERNAL);
-  // lowest accel sens
+  // Configure motion detection
+  mpu.setDLPFMode(MPU6050_DLPF_BW_5); // Even stronger filtering
   mpu.setFullScaleAccelRange(MPU6050_ACCEL_FS_2);
-  // lowest gyro sens
-  mpu.setFullScaleGyroRange(MPU6050_GYRO_FS_250);
-  mpu.setDHPFMode(MPU6050_DHPF_RESET); // reset high-pass filter in prep for hold mode
-
-  // // adjust values from calib script example, if needed
-  // mpu.setXGyroOffset(-69);
-  // mpu.setYGyroOffset(-48);
-  // mpu.setZGyroOffset(-19);
-  // mpu.setXAccelOffset(-5158);
-  // mpu.setYAccelOffset(-4576);
-  // mpu.setZAccelOffset(7687);
-  // level of movement required to trigger interrupt
-  // recommended default is 20
-  mpu.setMotionDetectionThreshold(1);
-  // number of milliseconds that the sensor must be at the threshold
-  mpu.setMotionDetectionDuration(1);
-
-  // enable only motion detection interrupt
-  mpu.setIntEnabled((1 << MPU6050_INTERRUPT_MOT_BIT) | (1 << MPU6050_INTERRUPT_FF_BIT));
-  mpu.setAccelerometerPowerOnDelay(2); //max 3
-  mpuSetInterruptMode();
-  // ensure the accellerometers are on
-  // mpu.setStandbyXAccelEnabled(false);
-  // mpu.setStandbyYAccelEnabled(false);
-  // mpu.setStandbyZAccelEnabled(false);
-
-  // we can sleep the gyro
+  mpu.setMotionDetectionThreshold(5); // Lower threshold (more sensitive)
+  mpu.setMotionDetectionDuration(1);  // Longer duration
+  
+  // Set interrupt to ACTIVE LOW for deep sleep wake
+  mpu.setInterruptMode(MPU6050_INTMODE_ACTIVELOW);
+  mpu.setInterruptLatch(true); // stay interrupted until read
+  mpu.setMotionDetectionCounterDecrement(MPU6050_DETECT_DECREMENT_1);
+  // Enable only motion detection interrupt
+  mpu.setIntEnabled(1 << MPU6050_INTERRUPT_MOT_BIT);
+  
+  
+  // Enable accelerometers, disable gyros for power saving
+  mpu.setStandbyXAccelEnabled(false);
+  mpu.setStandbyYAccelEnabled(false);
+  mpu.setStandbyZAccelEnabled(false);
   mpu.setStandbyXGyroEnabled(true);
   mpu.setStandbyYGyroEnabled(true);
   mpu.setStandbyZGyroEnabled(true);
-
-  mpu.setWakeFrequency(50);
-  mpu.setWakeCycleEnabled(true);
-  mpu.setSleepEnabled(true);
   
+  // Force a read of the interrupt status to clear it
+  mpu.getIntStatus();
 }
 
 /** mpu setup for active monitoring
@@ -240,6 +220,7 @@ void mpuMotionDetectMode() {
  */
 void mpuActiveMonitorMode() {
   // ensure the gyro is on
+  mpu.setWakeCycleEnabled(false);
   mpu.setStandbyXGyroEnabled(false);
   mpu.setStandbyYGyroEnabled(false);
   mpu.setStandbyZGyroEnabled(false);
@@ -286,16 +267,8 @@ void buildSpatialGrid() {
   memset(grid, 0, sizeof(grid));
 
   for(int i=0; i<NUM_PARTICLES; i++) {
-    #ifdef __AVR__
-      float x = TO_FLOAT(particles[i].x);
-      float y = TO_FLOAT(particles[i].y);
-    #else
-      float x = particles[i].x;
-      float y = particles[i].y;
-    #endif
-    
-    int gx = constrain(x / CELL_SIZE, 0, GRID_SIZE-1);
-    int gy = constrain(y / CELL_SIZE, 0, GRID_SIZE-1);
+    int gx = constrain(particles[i].x / CELL_SIZE, 0, GRID_SIZE-1);
+    int gy = constrain(particles[i].y / CELL_SIZE, 0, GRID_SIZE-1);
     
     if(grid[gx][gy].count < 10) {
       grid[gx][gy].particles[grid[gx][gy].count++] = i;
@@ -303,14 +276,54 @@ void buildSpatialGrid() {
   }
 }
 
+void drawHeart() {
+  canvas.clear();
+  
+  // Heart coordinates
+  const uint8_t heartX = SIM_WIDTH / 2;
+  const uint8_t heartY = SIM_HEIGHT / 2;
+  const uint8_t heartSize = 25;
+  
+  // Draw heart shape
+  for(float t = 0; t < 2*PI; t += 0.01) {
+    float x = 16 * pow(sin(t), 3);
+    float y = 13 * cos(t) - 5 * cos(2*t) - 2 * cos(3*t) - cos(4*t);
+    // Scale and position
+    x = x * heartSize / 16 + heartX;
+    y = -y * heartSize / 16 + heartY;
+    canvas.putPixel(x, y);
+  }
+  
+  // Add "Renee" text in the middle
+  canvas.setFixedFont(ssd1306xled_font6x8);
+  canvas.printFixed(heartX - 15, heartY - 3, "Renee", STYLE_NORMAL);
+  
+  // Display and pause
+  display.drawCanvas(0, 0, canvas);
+  // lcd_delay(2000);  // Show for 2 seconds
+}
 
 void setup() {
   DMPReady = false;
 #ifdef DEBUG
   initSerial();
+  esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
+  if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT0) {
+    Serial.println("Woke up due to external signal using RTC_IO");
+  } else {
+    Serial.println("Woke up for other reason");
+    Serial.println(wakeup_reason);
+  }
 #endif
   initI2C();
+  // setup display
+  display.begin();
+  display.clear();
+  canvas.setMode(CANVAS_MODE_TRANSPARENT);
+  drawHeart();
   initMpu();
+  // mpuMotionDetectMode();
+  // DMPReady = true;
   mpuActiveMonitorMode();
   pinMode(EXT0_PIN, INPUT);
 
@@ -321,13 +334,10 @@ void setup() {
   Serial.print(digitalPinToInterrupt(EXT0_PIN));
   Serial.println(F(")..."));
 #endif
-  attachInterrupt(digitalPinToInterrupt(EXT0_PIN), DMPDataReady, RISING);
+  attachInterrupt(digitalPinToInterrupt(EXT0_PIN), DMPDataReady, FALLING);
   MPUIntStatus = mpu.getIntStatus();
   // }
-  // setup display
-  display.begin();
-  display.clear();
-  canvas.setMode(CANVAS_MODE_TRANSPARENT);
+  
 
   // Initialize particles in a droplet pattern
   float cx = SIM_WIDTH/2;
@@ -345,6 +355,17 @@ void setup() {
 void applyPhysics() {
   // Build spatial grid
   buildSpatialGrid();
+
+  float baseGravity = GRAVITY;
+  float accelBoost = constrain(maxAccelImpulse / 5000.0f, 0.0f, 2.0f);
+
+  // Decay the impulse over time
+  maxAccelImpulse *= 0.95f;
+  // Apply external forces from accelerometer
+  float accelForceX = constrain(rawAccel.x / 50.0f, -1.0f, 1.0f);
+  float accelForceY = constrain(rawAccel.y / 50.0f, -1.0f, 1.0f);
+  float impulseX = constrain(accelDelta.x / 1000.0f, -2.0f, 2.0f);
+  float impulseY = constrain(accelDelta.y / 1000.0f, -2.0f, 2.0f);
 
   // Interactions using grid
   const float PRESSURE_RADIUS_SQ = PRESSURE_RADIUS * PRESSURE_RADIUS;
@@ -387,21 +408,37 @@ void applyPhysics() {
 
     // Gravity and movement
   for(int i=0; i<NUM_PARTICLES; i++) {
-    particles[i].vy += gravity.x * GRAVITY; // x / y flipped
-    particles[i].vx += gravity.y * GRAVITY;
+    particles[i].vy += gravity.x * baseGravity; 
+    particles[i].vx += gravity.y * baseGravity;
+
+    // Add accelerometer impulse (decays naturally)
+    float impulseX = gravity.y * accelBoost * 2.0f;
+    float impulseY = gravity.x * accelBoost * 2.0f;
+
+    // particles[i].vx += accelForceX * 0.8f;
+    // particles[i].vy += accelForceY * 0.8f;
+    particles[i].vx += impulseX;
+    particles[i].vy += impulseY;
+    if (accelBoost > 0.5f) {
+      particles[i].vx += (random(100) - 50) / 500.0f * accelBoost;
+      particles[i].vy += (random(100) - 50) / 500.0f * accelBoost;
+    }
     particles[i].x += particles[i].vx;
     particles[i].y += particles[i].vy;
     particles[i].vx = constrain(particles[i].vx, -MAX_VEL, MAX_VEL);
     particles[i].vy = constrain(particles[i].vy, -MAX_VEL, MAX_VEL);
+
+    // Apply stronger damping during high movement
+    float adaptiveDamping = DAMPING * (1.0f - accelBoost * 0.2f);
     // X-axis
     if(particles[i].x <= 0 || particles[i].x >= SIM_WIDTH-1) {
-      particles[i].vx *= -DAMPING;
+      particles[i].vx *= -adaptiveDamping;
       particles[i].x = constrain(particles[i].x, 1, SIM_WIDTH-2);
     }
     
     // Y-axis
     if(particles[i].y <= 0 || particles[i].y >= SIM_HEIGHT-1) {
-      particles[i].vy *= -DAMPING;
+      particles[i].vy *= -adaptiveDamping;
       particles[i].y = constrain(particles[i].y, 1, SIM_HEIGHT-2);
     }
   }
@@ -455,33 +492,64 @@ void reportIMU() {
     if (mpu.dmpGetCurrentFIFOPacket(FIFOBuffer)) { // Get the Latest packet 
         mpu.dmpGetQuaternion(&q, FIFOBuffer);
         mpu.dmpGetGravity(&gravity, &q); // this is all we care about right now
+        mpu.dmpGetAccel(&aa, FIFOBuffer);
+        rawAccel.x = aa.x / 2048; // Scale to reasonable values
+        rawAccel.y = aa.y / 2048;
+        rawAccel.z = aa.z / 2048;
+        accelDelta.x = aa.x - lastAccel.x;
+        accelDelta.y = aa.y - lastAccel.y;
+        accelDelta.z = aa.z - lastAccel.z;
+        lastAccel = aa;
+         // Calculate magnitude of acceleration for impulse detection
+        lastAccelMagnitude = accelMagnitude;
+        accelMagnitude = sqrt(aa.x*aa.x + aa.y*aa.y + aa.z*aa.z);
+        
+        // Detect sudden changes (ignoring gravity component of ~16384)
+        float accelDelta = abs(accelMagnitude - lastAccelMagnitude);
+        maxAccelImpulse = max(maxAccelImpulse * 0.9f, accelDelta);
     }
   }
+  else {
+    //it's another interrupt
 #ifdef DEBUG
-// change LED state
-  blinkState = !blinkState;
-  digitalWrite(LED, blinkState);
+    // change LED state
+    blinkState = !blinkState;
+    digitalWrite(LED, blinkState);
 #endif
+  }
   // reset interrupt flag
   MPUInterrupt = false;
 }
 
+void goToSleep() {
+  display.m_i2c.displayOff();
+  // detach interrupt
+  // detachInterrupt(digitalPinToInterrupt(EXT0_PIN));
+  // Prepare MPU6050 for motion detection
+  mpuMotionDetectMode();
+  
+  // Force a read to clear any pending interrupts
+  mpu.getIntStatus();
+  
+  // Add a brief delay to ensure MPU settles
+  delay(100);
+  
+  // Configure the wake-up source (active LOW)
+  esp_sleep_enable_ext0_wakeup(GPIO_NUM_34, 0);
+  
+  // Debug message
+#ifdef DEBUG
+  Serial.println("Going to deep sleep now");
+  Serial.flush();
+#endif
+  
+  // Enter deep sleep
+  esp_deep_sleep_start();
+}
+
 void sleepTimer() {
   if (zMotInterrupt && millis() - lastZMot > SLEEP_AFTER_MS) {
-#ifdef DEBUG
-    Serial.println(F("Going to sleep"));
-#endif
-    display.m_i2c.displayOff();
-    // detach interrupt
-    detachInterrupt(digitalPinToInterrupt(EXT0_PIN));
-    // sleep
-    mpuMotionDetectMode();
-    // clear any pending interrupts
-    mpu.getIntStatus();
-    // enable wakeup from ext0
-    esp_sleep_enable_ext0_wakeup(GPIO_NUM_34, 0);
-    lcd_delay(150);
-    esp_deep_sleep_start();
+    goToSleep();
   }
 }
 
